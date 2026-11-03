@@ -36,6 +36,7 @@ ID_BLOCK = 100
 FINAL_IDS = 900
 FINAL_REFINE_ID = 950
 EXTRA_REFINE_ID = 960
+CREDIT_LIMIT = 4_900_000
 PICK_EFFORT = "low"
 PICK_PX = 1024
 PICK_CALL_CREDITS = 40_000
@@ -222,7 +223,7 @@ def _pair_penalties(text: str | None) -> tuple[float, float]:
         return 5.0, 5.0
 
 
-def _judge_pick(witness, renderer, ref: bytes, modules: list[str]) -> str:
+def _judge_pick(witness, renderer, ref: bytes, modules: list[str], acc: list | None = None) -> str:
     shots: dict[int, list[bytes]] = {}
     for i, js in enumerate(modules):
         try:
@@ -248,6 +249,8 @@ def _judge_pick(witness, renderer, ref: bytes, modules: list[str]) -> str:
                              instructions=prompts.JUDGE_SYSTEM, content=content)
 
     answers = _parallel([job(k, x, y, v) for k, (x, y, v) in enumerate(asks)])
+    if acc is not None:
+        acc.append(ledger.credits)
     pen = {i: 0.0 for i in alive}
     for (x, y, _), text in zip(asks, answers):
         p1, p2 = _pair_penalties(text)
@@ -257,10 +260,12 @@ def _judge_pick(witness, renderer, ref: bytes, modules: list[str]) -> str:
 
 
 def _final_refine(witness, renderer, ref: bytes, best: str, sheet: bytes, text: str | None = None,
-                  rid: int = FINAL_REFINE_ID) -> str:
+                  rid: int = FINAL_REFINE_ID, acc: list | None = None, model: str | None = None) -> str:
     ledger = Ledger(credit_cap=FINAL_REFINE_CREDITS + 1, call_cap=1)
     text = prompts.FINAL_REFINE_USER if text is None else text
-    js = extract(_call(witness, ledger, rid, "final", text % best, [ref, sheet], effort=REFINE_EFFORT))
+    js = extract(_call(witness, ledger, rid, "final", text % best, [ref, sheet], model=model, effort=REFINE_EFFORT))
+    if acc is not None:
+        acc.append(ledger.credits)
     wrapped = wrap(js) if js is not None else None
     if wrapped is None:
         return best
@@ -284,9 +289,10 @@ def run(image: bytes, seed: int, witness, renderer) -> str | None:
             c.settle(renderer, kind)
     found = [c.best for c in chains if c.best is not None]
     spent = sum(c.ledger.credits for c in chains)
+    acc: list = []
     pick_cost = len(found) * (len(found) - 1) * len(prompts.JUDGE_VIEWS) * PICK_CALL_CREDITS
     if len(found) > 1 and spent + pick_cost + FINAL_REFINE_CREDITS <= TOTAL_CREDITS:
-        best = _judge_pick(witness, renderer, ref, found)
+        best = _judge_pick(witness, renderer, ref, found, acc)
     elif len(found) > 1 and spent + 2 * EXPECTED_PANEL_CREDITS <= TOTAL_CREDITS:
         best = _panel(witness, renderer, ref, found)
     else:
@@ -295,15 +301,16 @@ def run(image: bytes, seed: int, witness, renderer) -> str | None:
                     else 2 * EXPECTED_PANEL_CREDITS)
     if best is not None and spent + 2 * EXPECTED_PANEL_CREDITS + FINAL_REFINE_CREDITS <= TOTAL_CREDITS:
         sheet = next(c.best_sheet for c in chains if c.best is best)
-        best = _final_refine(witness, renderer, ref, best, sheet)
+        best = _final_refine(witness, renderer, ref, best, sheet, acc=acc)
         used += FINAL_REFINE_CREDITS
         for k, text in enumerate(prompts.EXTRA_REFINES):
-            if used + FINAL_REFINE_CREDITS > TOTAL_CREDITS:
+            # the real credits spent so far decide, not the estimate (that skipped the 4th refine)
+            if spent + sum(acc) + FINAL_REFINE_CREDITS > CREDIT_LIMIT:
                 break
             sheet, err = _sheet_or_error(renderer, wrap(best))
             if err is not None:
                 break
-            best = _final_refine(witness, renderer, ref, best, sheet, text, EXTRA_REFINE_ID + 10 * k)
+            best = _final_refine(witness, renderer, ref, best, sheet, text, EXTRA_REFINE_ID + 10 * k, acc)
             used += FINAL_REFINE_CREDITS
     out = output(best) if best is not None else None
     _trace(key, "final", out)
